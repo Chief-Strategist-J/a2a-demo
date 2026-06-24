@@ -1,0 +1,20 @@
+services:
+
+  worker:
+    build: ./worker
+    ports:
+      - "8001:8001"
+    env_file: .env
+    environment:
+      WORKER_PUBLIC_URL: "http://worker:8001"
+
+  planner:
+    build: ./planner
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      WORKER_URL: "http://worker:8001"
+      PLANNER_PUBLIC_URL: "http://planner:8000"
+    depends_on:
+      - worker

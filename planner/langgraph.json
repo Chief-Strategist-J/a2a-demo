@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "planner_graph": "./main.py:graph"
+  },
+  "env": "../.env"
+}
