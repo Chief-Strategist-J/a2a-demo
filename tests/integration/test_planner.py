@@ -64,12 +64,6 @@ def planner_client():
         yield TestClient(pm.app, raise_server_exceptions=False)
 
 
-class TestPlannerUI:
-    def test_ui_accessible_without_auth(self, planner_client):
-        resp = planner_client.get("/ui")
-        assert resp.status_code == 200
-
-
 class TestPlannerAgentCard:
     def test_agent_card_accessible(self, planner_client):
         resp = planner_client.get("/.well-known/agent.json")

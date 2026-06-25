@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "planner-agent"
@@ -8,7 +8,10 @@ version = "0.1.0"
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
-    "langgraph",
     "httpx",
-    "python-dotenv",
+    "langgraph>=0.2.0",
+    "openai>=1.30.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0.1",
+    "python-dotenv>=1.0.0",
 ]
