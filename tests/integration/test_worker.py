@@ -1,6 +1,6 @@
 """Integration tests for the Worker agent FastAPI app.
 
-Uses TestClient — no real server, no real LLM calls (patched via mock_llm).
+Uses TestClient — no real server, no real LLM calls (build_chain is patched).
 """
 from __future__ import annotations
 
@@ -14,23 +14,20 @@ from starlette.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-# Patch build_client BEFORE importing worker.main so the app builds with a mock.
 from tests.conftest import make_mock_llm
+from shared.model_factory import ModelChain
 
-_MOCK_CLIENT = make_mock_llm("Worker mock answer.")
+_MOCK_CHAIN = ModelChain.from_mock(make_mock_llm("Worker mock answer."))
 
 
 @pytest.fixture(scope="module")
 def worker_client():
-    with patch("shared.model_factory.build_client", return_value=_MOCK_CLIENT):
+    with patch("shared.model_factory.build_chain", return_value=_MOCK_CHAIN):
+        for key in list(sys.modules.keys()):
+            if key in ("worker.main", "worker"):
+                del sys.modules[key]
         import worker.main as wm
-        importlib_reload_if_needed(wm)
         yield TestClient(wm.app, raise_server_exceptions=False)
-
-
-def importlib_reload_if_needed(module):
-    """No-op helper; module is already imported fresh in this process."""
-    pass
 
 
 VALID_TOKEN = "worker-dev-token"

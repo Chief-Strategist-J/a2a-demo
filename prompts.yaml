@@ -1,16 +1,6 @@
-# ============================================================
-# Prompt Library
-# ============================================================
-# Each prompt has an id, version, description, and template.
-# Templates support {{variable}} substitution.
-# Reference a prompt in config.yaml via  prompt_id: <id>
-# ============================================================
-
 version: "1.0"
 
 prompts:
-
-  # ── Worker prompts ─────────────────────────────────────────
 
   worker_default:
     version: "1.0"
@@ -57,8 +47,6 @@ prompts:
     variables:
       - agent_name
       - current_date
-
-  # ── Planner prompts ────────────────────────────────────────
 
   planner_router:
     version: "1.0"

@@ -8,8 +8,9 @@ from tests.conftest import make_mock_llm, make_mock_llm_with_tool
 from shared.config import load
 from shared.context import ContextManager
 from shared.graph_builder import AgentState, build_graph
+from shared.model_factory import ModelChain
 from shared.outcomes import OutcomeRecorder
-import shared.tools.calculator  # registers tool
+import shared.tools.calculator
 import shared.tools.web_search
 
 ROOT = Path(__file__).parent.parent.parent
@@ -18,17 +19,14 @@ cfg = load(ROOT / "config.yaml")
 
 def _worker_graph(mock_client=None, ctx=None, rec=None):
     agent_cfg = cfg.agents["worker"]
-    provider_cfg = cfg.providers.get(agent_cfg.model.provider, {})
     return build_graph(
         flow_cfg=agent_cfg.flow.model_dump(),
-        model_cfg=agent_cfg.model.model_dump(),
-        provider_cfg=provider_cfg,
+        model_chain=ModelChain.from_mock(mock_client or make_mock_llm()),
         tool_cfgs=[t.model_dump() for t in agent_cfg.tools],
         agent_endpoints={},
         agent_name=agent_cfg.name,
         ctx_mgr=ctx or ContextManager.default(),
         recorder=rec or OutcomeRecorder("worker", "test/model", outcomes_dir="/tmp/test_outcomes"),
-        llm_client=mock_client,
     )
 
 
@@ -53,12 +51,19 @@ class TestGraphConstruction:
         with pytest.raises(ValueError, match="Unknown node type"):
             build_graph(
                 flow_cfg=bad_flow,
-                model_cfg={"provider": "groq", "model_id": "x"},
-                provider_cfg={},
+                model_chain=ModelChain.from_mock(make_mock_llm()),
                 tool_cfgs=[],
                 agent_endpoints={},
-                llm_client=make_mock_llm(),
             )
+
+    def test_llm_call_without_chain_raises(self):
+        flow = {
+            "entry": "n1",
+            "nodes": [{"id": "n1", "type": "llm_call", "config": {}}],
+            "edges": [],
+        }
+        with pytest.raises(ValueError, match="no model_chain"):
+            build_graph(flow_cfg=flow, model_chain=None, tool_cfgs=[], agent_endpoints={})
 
 
 @pytest.mark.asyncio
@@ -111,7 +116,6 @@ class TestToolCallNode:
             tool_args={"expression": "2 + 2"},
             follow_up_answer="The answer is 4.",
         )
-        # Enable calculator in tool_cfgs
         agent_cfg = cfg.agents["worker"]
         tool_cfgs = [
             {"name": "calculator", "enabled": True, "description": "math"},
@@ -119,14 +123,12 @@ class TestToolCallNode:
         ]
         g = build_graph(
             flow_cfg=agent_cfg.flow.model_dump(),
-            model_cfg=agent_cfg.model.model_dump(),
-            provider_cfg={},
+            model_chain=ModelChain.from_mock(mock),
             tool_cfgs=tool_cfgs,
             agent_endpoints={},
             agent_name=agent_cfg.name,
             ctx_mgr=ContextManager.default(),
             recorder=OutcomeRecorder("worker", "t", outcomes_dir="/tmp/test_outcomes"),
-            llm_client=mock,
         )
         state = await g.ainvoke({
             "task_id": "tool-1", "question": "What is 2 + 2?",

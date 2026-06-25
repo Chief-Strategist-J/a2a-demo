@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# run.sh  –  A2A Demo launcher
-#
-# Usage:
-#   ./run.sh              # start both agents with Docker Compose (default)
-#   ./run.sh docker       # same as above
-#   ./run.sh test         # send a test question to the running Planner
-#   ./run.sh studio worker   # open Worker graph in LangGraph Studio
-#   ./run.sh studio planner  # open Planner graph in LangGraph Studio
-#                             # (also starts the Worker in the background)
-# ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +9,6 @@ PIP="$VENV/bin/pip"
 UVICORN="$VENV/bin/uvicorn"
 LANGGRAPH="$VENV/bin/langgraph"
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -30,7 +18,6 @@ success() { echo -e "${GREEN}✓ $*${RESET}"; }
 warn()    { echo -e "${YELLOW}⚠ $*${RESET}"; }
 die()     { echo -e "${RED}✗ $*${RESET}" >&2; exit 1; }
 
-# ── .env check ───────────────────────────────────────────────────────────────
 
 check_env() {
     if [ ! -f "$SCRIPT_DIR/.env" ]; then
@@ -42,21 +29,18 @@ check_env() {
     set +o allexport
 }
 
-# ── Mode: docker ─────────────────────────────────────────────────────────────
 
 run_docker() {
     command -v docker >/dev/null 2>&1 || die "Docker is not installed."
     docker compose version >/dev/null 2>&1 || die "Docker Compose is not installed."
 
     info "Building and starting Planner (port 8000) and Worker (port 8001)…"
-    info "Trace viewer will be at: http://localhost:8000/ui"
     echo ""
 
     cd "$SCRIPT_DIR"
     docker compose up --build
 }
 
-# ── Mode: test ────────────────────────────────────────────────────────────────
 
 run_test() {
     command -v curl >/dev/null 2>&1 || die "curl is not installed."
@@ -77,7 +61,6 @@ run_test() {
     echo "$RESPONSE" | "$PYTHON" -m json.tool 2>/dev/null || echo "$RESPONSE"
 }
 
-# ── Mode: studio ─────────────────────────────────────────────────────────────
 
 WORKER_PID=""
 
@@ -89,9 +72,8 @@ cleanup_worker() {
 }
 
 run_studio() {
-    AGENT="${2:-worker}"   # default to worker if not specified
+    AGENT="${2:-worker}"
 
-    # Check venv exists
     [ -f "$LANGGRAPH" ] || die "Venv not found at $VENV.\nRun: python3 -m venv .venv && .venv/bin/pip install -r worker/requirements.txt -r planner/requirements.txt langgraph-cli[inmem]"
 
     case "$AGENT" in
@@ -106,9 +88,6 @@ run_studio() {
             ;;
 
         planner)
-            # The Planner's delegate_to_worker node makes a live HTTP call to
-            # the Worker, so the Worker must be running before Studio can execute
-            # a full Planner run.
 
             info "Starting Worker in background on port 8001…"
 
@@ -119,7 +98,6 @@ run_studio() {
             WORKER_PID=$!
             trap cleanup_worker EXIT
 
-            # Wait for Worker to be ready
             info "Waiting for Worker to be ready…"
             for i in $(seq 1 20); do
                 if curl -sf http://localhost:8001/.well-known/agent.json >/dev/null 2>&1; then
@@ -148,7 +126,6 @@ run_studio() {
     esac
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 MODE="${1:-docker}"
 

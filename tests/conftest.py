@@ -14,14 +14,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Ensure repo root is on the path so `shared.*` imports work from any cwd
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Point tests at the real config/prompts/context files
 os.environ.setdefault("CONFIG_PATH", str(ROOT / "config.yaml"))
 os.environ.setdefault("PROMPTS_PATH", str(ROOT / "prompts.yaml"))
 os.environ.setdefault("CONTEXT_PATH", str(ROOT / "context.yaml"))
+
+os.environ.setdefault("GEMINI_API_KEY", "_test_key_gemini")
+os.environ.setdefault("GROQ_API_KEY", "_test_key_groq")
+os.environ.setdefault("OPENROUTER_API_KEY", "_test_key_openrouter")
 
 
 def make_mock_llm(answer: str = "This is a mock answer.") -> MagicMock:
@@ -49,7 +51,6 @@ def make_mock_llm_with_tool(
     """Return a mock that makes one tool call then answers."""
     import json
 
-    # First call: returns a tool_call
     tc = MagicMock()
     tc.id = "call_abc"
     tc.function.name = tool_name
@@ -62,7 +63,6 @@ def make_mock_llm_with_tool(
     first_resp = MagicMock()
     first_resp.choices = [MagicMock(message=first_msg)]
 
-    # Second call (follow-up): returns plain text
     second_msg = MagicMock()
     second_msg.content = follow_up_answer
     second_msg.tool_calls = None

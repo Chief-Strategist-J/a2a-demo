@@ -30,13 +30,14 @@ def _load_raw(path: str | Path) -> dict:
         return _interpolate(yaml.safe_load(f))
 
 
-# ---------- typed models ----------
 
-class ModelCfg(BaseModel):
+class ModelRegistryCfg(BaseModel):
+    """A named model entry in the models: registry."""
     provider: str
     model_id: str
     temperature: float = 0.1
     max_tokens: int = 1024
+    api_keys: List[str] = Field(default_factory=list)
 
 
 class NodeCfg(BaseModel):
@@ -70,7 +71,7 @@ class AgentCfg(BaseModel):
     description: str
     port: int
     public_url: str
-    model: ModelCfg
+    model_chain: List[str]
     flow: FlowCfg
     tools: List[ToolCfg] = Field(default_factory=list)
     skills: List[SkillCfg] = Field(default_factory=list)
@@ -90,11 +91,12 @@ class StreamingCfg(BaseModel):
 
 
 class AppCfg(BaseModel):
+    models: Dict[str, ModelRegistryCfg] = Field(default_factory=dict)
     agents: Dict[str, AgentCfg]
     agent_endpoints: Dict[str, EndpointCfg] = Field(default_factory=dict)
     auth: AuthCfg = Field(default_factory=AuthCfg)
     streaming: StreamingCfg = Field(default_factory=StreamingCfg)
-    providers: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    providers: Dict[str, Any] = Field(default_factory=dict)
 
 
 def load(path: str | Path = "config.yaml") -> AppCfg:

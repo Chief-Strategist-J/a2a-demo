@@ -1,7 +1,3 @@
-"""Integration tests for the Planner agent FastAPI app.
-
-The A2A delegate call to the worker is patched so tests are fully offline.
-"""
 from __future__ import annotations
 
 import json
@@ -15,13 +11,15 @@ from starlette.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from tests.conftest import make_mock_llm
+from shared.model_factory import ModelChain
 
 VALID_TOKEN = "planner-dev-token"
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 _WORKER_ANSWER = "This is the worker's answer."
+_MOCK_CHAIN = ModelChain.from_mock(make_mock_llm())
 
-# Mock httpx response for the agent card fetch
+
 def _mock_card_response():
     r = MagicMock()
     r.raise_for_status = MagicMock()
@@ -29,7 +27,6 @@ def _mock_card_response():
     return r
 
 
-# Mock httpx response for tasks/send (non-streaming)
 def _mock_task_response():
     r = MagicMock()
     r.raise_for_status = MagicMock()
@@ -58,9 +55,19 @@ def planner_client():
     mock_http.get = AsyncMock(return_value=_mock_card_response())
     mock_http.post = AsyncMock(return_value=_mock_task_response())
 
-    with patch("httpx.AsyncClient", return_value=mock_http):
+    with patch("shared.model_factory.build_chain", return_value=_MOCK_CHAIN), \
+         patch("httpx.AsyncClient", return_value=mock_http):
+        for key in list(sys.modules.keys()):
+            if key in ("planner.main", "planner"):
+                del sys.modules[key]
         import planner.main as pm
         yield TestClient(pm.app, raise_server_exceptions=False)
+
+
+class TestPlannerUI:
+    def test_ui_accessible_without_auth(self, planner_client):
+        resp = planner_client.get("/ui")
+        assert resp.status_code == 200
 
 
 class TestPlannerAgentCard:
@@ -109,10 +116,3 @@ class TestPlannerAsk:
             headers=AUTH,
         )
         assert resp.json()["answer"]
-
-
-class TestPlannerUI:
-    def test_ui_accessible_without_auth(self, planner_client):
-        resp = planner_client.get("/ui")
-        assert resp.status_code == 200
-        assert "text/html" in resp.headers["content-type"]

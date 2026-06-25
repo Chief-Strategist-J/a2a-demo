@@ -2,7 +2,7 @@ services:
 
   worker:
     build:
-      context: .                        # root = A2A/ so shared/ is reachable
+      context: .
       dockerfile: worker/Dockerfile
     ports:
       - "8001:8001"

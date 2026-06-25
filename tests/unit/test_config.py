@@ -19,7 +19,6 @@ class TestEnvInterpolation:
         monkeypatch.setenv("MY_TEST_VAR", "hello")
         raw = {"key": "${MY_TEST_VAR}"}
         import yaml, io
-        # Write a temp file
         tmp = Path("/tmp/test_interp.yaml")
         tmp.write_text(yaml.dump(raw))
         result = _load_raw(tmp)
@@ -71,11 +70,19 @@ class TestConfigLoad:
         cfg = load(CONFIG)
         assert "worker" in cfg.agents
 
-    def test_planner_has_model(self):
+    def test_planner_has_model_chain(self):
         cfg = load(CONFIG)
-        model = cfg.agents["planner"].model
-        assert model.provider in ("groq", "gemini", "openrouter", "ollama")
-        assert model.model_id
+        chain = cfg.agents["planner"].model_chain
+        assert isinstance(chain, list)
+        assert len(chain) > 0
+
+    def test_models_registry_present(self):
+        cfg = load(CONFIG)
+        assert len(cfg.models) > 0
+        for mid, mcfg in cfg.models.items():
+            assert mcfg.provider
+            assert mcfg.model_id
+            assert isinstance(mcfg.api_keys, list)
 
     def test_worker_has_flow(self):
         cfg = load(CONFIG)

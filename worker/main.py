@@ -25,25 +25,26 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# Make repo root importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+if "pytest" not in sys.modules:
+    load_dotenv(Path(__file__).parent.parent / ".env")
 
 from shared import config as cfg_mod
 from shared import prompts as prompt_lib
 from shared.auth import BearerAuthMiddleware
 from shared.context import ContextManager
 from shared.graph_builder import AgentState, build_graph
+from shared.model_factory import build_chain
 from shared.outcomes import OutcomeRecorder
 
-# ── register tools (import = side-effect registration) ────────
-import shared.tools.calculator  # noqa: F401
-import shared.tools.web_search   # noqa: F401
-# Add new tools here:  import shared.tools.my_tool
+import shared.tools.calculator
+import shared.tools.web_search
 
-# ── config ───────────────────────────────────────────────────
 
 _ROOT = Path(__file__).parent.parent
 _CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", _ROOT / "config.yaml"))
@@ -52,7 +53,7 @@ _CONTEXT_PATH = Path(os.environ.get("CONTEXT_PATH", _ROOT / "context.yaml"))
 
 cfg = cfg_mod.load(_CONFIG_PATH)
 agent_cfg = cfg.agents["worker"]
-provider_cfg = cfg.providers.get(agent_cfg.model.provider, {})
+_model_chain = build_chain(agent_cfg.model_chain, cfg.models, cfg.providers)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,7 +62,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("worker")
 
-# ── load prompts and context config ──────────────────────────
 
 if _PROMPTS_PATH.exists():
     prompt_lib.load(_PROMPTS_PATH)
@@ -73,15 +73,13 @@ _ctx_managers = (
 _ctx = _ctx_managers.get("worker") or ContextManager.default()
 _recorder = OutcomeRecorder(
     agent="worker",
-    model=f"{agent_cfg.model.provider}/{agent_cfg.model.model_id}",
+    model=_model_chain.primary_label,
 )
 
-# ── graph ────────────────────────────────────────────────────
 
 graph = build_graph(
     flow_cfg=agent_cfg.flow.model_dump(),
-    model_cfg=agent_cfg.model.model_dump(),
-    provider_cfg=provider_cfg,
+    model_chain=_model_chain,
     tool_cfgs=[t.model_dump() for t in agent_cfg.tools],
     agent_endpoints={},
     agent_name=agent_cfg.name,
@@ -90,7 +88,6 @@ graph = build_graph(
     outbound_token="",
 )
 
-# ── FastAPI app ──────────────────────────────────────────────
 
 app = FastAPI(title=agent_cfg.name, version="2.0.0")
 
@@ -100,7 +97,6 @@ if cfg.auth.enabled:
         valid_tokens=set(cfg.auth.tokens.values()),
     )
 
-# ── A2A Agent Card ───────────────────────────────────────────
 
 _AGENT_CARD = {
     "name": agent_cfg.name,
@@ -134,11 +130,10 @@ async def health():
     return {
         "status": "ok",
         "agent": agent_cfg.name,
-        "model": f"{agent_cfg.model.provider}/{agent_cfg.model.model_id}",
+        "model_chain": _model_chain.chain_labels,
     }
 
 
-# ── A2A JSON-RPC 2.0 endpoint ────────────────────────────────
 
 @app.post("/")
 async def a2a(request: Request):
@@ -171,7 +166,6 @@ async def a2a(request: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # ── synchronous path ──────────────────────────────────────
     final: AgentState = await graph.ainvoke(
         {"task_id": task_id, "question": question, "answer": "", "tool_results": []}
     )
@@ -207,7 +201,6 @@ async def _stream_task(
 ) -> AsyncIterator[bytes]:
     """Run the LangGraph graph and emit A2A SSE events."""
 
-    # 1. Emit working state immediately so the client knows we're active
     yield _sse({
         "jsonrpc": "2.0",
         "id": jsonrpc_id,
@@ -227,7 +220,6 @@ async def _stream_task(
         ):
             if mode == "values" and chunk.get("answer"):
                 final_answer = chunk["answer"]
-                # 2. Emit artifact event as content becomes available
                 yield _sse({
                     "jsonrpc": "2.0",
                     "id": jsonrpc_id,
@@ -242,7 +234,6 @@ async def _stream_task(
                     },
                 })
 
-        # 3. Emit completed status with the full answer
         log.info("[A2A stream]  task %s completed (%d chars)", task_id, len(final_answer))
         yield _sse({
             "jsonrpc": "2.0",

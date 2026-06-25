@@ -30,18 +30,16 @@ from typing import Any, AsyncIterator, TypedDict
 
 import httpx
 from langgraph.graph import END, StateGraph
-from openai import AsyncOpenAI
 
 from shared import prompts as prompt_lib
 from shared.context import ContextError, ContextManager
-from shared.model_factory import build_client
+from shared.model_factory import ModelChain
 from shared.outcomes import OutcomeRecorder
 from shared.tools.registry import Tool, get_enabled
 
 log = logging.getLogger(__name__)
 
 
-# ── shared agent state ───────────────────────────────────────
 
 class AgentState(TypedDict):
     task_id: str
@@ -50,7 +48,6 @@ class AgentState(TypedDict):
     tool_results: list[dict]
 
 
-# ── node factories ────────────────────────────────────────────
 
 def _make_passthrough(node_id: str):
     async def _node(state: AgentState) -> dict:
@@ -68,16 +65,13 @@ def _make_passthrough(node_id: str):
 
 def _make_llm_call(
     node_id: str,
-    model_cfg: dict,
-    provider_cfg: dict,
+    model_chain: ModelChain,
     node_cfg: dict,
     tool_cfgs: list[dict],
     agent_name: str,
     ctx_mgr: ContextManager,
     recorder: OutcomeRecorder,
-    llm_client: AsyncOpenAI | None = None,
 ):
-    client: AsyncOpenAI = llm_client or build_client(model_cfg["provider"], provider_cfg)
     use_tools: bool = node_cfg.get("use_tools", False)
     prompt_id: str | None = node_cfg.get("prompt_id")
     inline_prompt: str = node_cfg.get("system_prompt", "You are a helpful assistant.")
@@ -89,15 +83,13 @@ def _make_llm_call(
     async def _node(state: AgentState) -> dict:
         task_id = state.get("task_id") or str(uuid.uuid4())
         log.info(
-            "[node: %s]  task_id=%s  model=%s/%s  tools=%s",
+            "[node: %s]  task_id=%s  chain=%s  tools=%s",
             node_id,
             task_id,
-            model_cfg["provider"],
-            model_cfg["model_id"],
+            model_chain.primary_label,
             [t.name for t in enabled_tools] or "none",
         )
 
-        # ── 1. validate input ─────────────────────────────────
         try:
             question = ctx_mgr.validate_input(state.get("question", ""))
         except ContextError as exc:
@@ -105,7 +97,6 @@ def _make_llm_call(
             recorder.record(task_id, "", "", 0, error=str(exc))
             return {"answer": f"[input error] {exc}"}
 
-        # ── 2. resolve system prompt ──────────────────────────
         try:
             if prompt_id and prompt_lib.is_loaded():
                 system_prompt = prompt_lib.render(
@@ -117,28 +108,21 @@ def _make_llm_call(
             log.error("[node: %s]  prompt error: %s", node_id, exc)
             system_prompt = inline_prompt
 
-        # ── 3. build messages ─────────────────────────────────
         messages = ctx_mgr.build_messages(system_prompt, question)
 
-        create_kwargs: dict[str, Any] = dict(
-            model=model_cfg["model_id"],
-            messages=messages,
-            temperature=model_cfg.get("temperature", 0.1),
-            max_tokens=model_cfg.get("max_tokens", 1024),
-        )
+        extra: dict[str, Any] = {}
         if tool_schemas:
-            create_kwargs["tools"] = tool_schemas
-            create_kwargs["tool_choice"] = "auto"
+            extra["tools"] = tool_schemas
+            extra["tool_choice"] = "auto"
 
         t_start = time.monotonic()
         tool_calls_used: list[str] = []
 
-        # ── 4. call LLM ───────────────────────────────────────
         try:
-            response = await client.chat.completions.create(**create_kwargs)
+            response, used_cfg = await model_chain.call(messages, extra)
         except Exception as exc:
             latency = int((time.monotonic() - t_start) * 1000)
-            log.error("[node: %s]  LLM call failed: %s", node_id, exc)
+            log.error("[node: %s]  all models in chain failed: %s", node_id, exc)
             recorder.record(task_id, question, "", latency, error=str(exc))
             return {"answer": f"[llm error] The AI call failed: {exc}"}
 
@@ -148,7 +132,6 @@ def _make_llm_call(
 
         msg = response.choices[0].message
 
-        # ── 5. handle tool calls ──────────────────────────────
         if msg.tool_calls and tool_map:
             messages.append(msg)
             tool_results: list[dict] = list(state.get("tool_results") or [])
@@ -172,12 +155,7 @@ def _make_llm_call(
                 })
 
             try:
-                follow = await client.chat.completions.create(
-                    model=model_cfg["model_id"],
-                    messages=messages,
-                    temperature=model_cfg.get("temperature", 0.1),
-                    max_tokens=model_cfg.get("max_tokens", 1024),
-                )
+                follow, _ = await model_chain.call(messages)
             except Exception as exc:
                 latency = int((time.monotonic() - t_start) * 1000)
                 log.error("[node: %s]  tool follow-up LLM call failed: %s", node_id, exc)
@@ -190,7 +168,6 @@ def _make_llm_call(
         else:
             raw_answer = msg.content or ""
 
-        # ── 6. validate output ────────────────────────────────
         try:
             answer = ctx_mgr.validate_output(raw_answer)
         except ContextError as exc:
@@ -204,7 +181,7 @@ def _make_llm_call(
 
         result_state: dict[str, Any] = {"answer": answer}
         if tool_calls_used:
-            result_state["tool_results"] = tool_results  # type: ignore[assignment]
+            result_state["tool_results"] = tool_results
         return result_state
 
     _node.__name__ = node_id
@@ -232,7 +209,6 @@ def _make_a2a_delegate(
             log.warning("[node: %s]  empty question — skipping A2A call", node_id)
             return {"answer": "[delegate error] Empty question."}
 
-        # Discover worker via Agent Card
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 card_resp = await client.get(f"{worker_url}/.well-known/agent.json")
@@ -326,36 +302,36 @@ async def _consume_sse(url: str, payload: dict, headers: dict) -> str:
     return final_answer
 
 
-# ── public API ────────────────────────────────────────────────
 
 def build_graph(
     flow_cfg: dict,
-    model_cfg: dict,
-    provider_cfg: dict,
-    tool_cfgs: list[dict],
-    agent_endpoints: dict,
+    model_chain: ModelChain | None = None,
+    tool_cfgs: list[dict] | None = None,
+    agent_endpoints: dict | None = None,
     agent_name: str = "Agent",
     ctx_mgr: ContextManager | None = None,
     recorder: OutcomeRecorder | None = None,
     outbound_token: str = "",
-    llm_client: AsyncOpenAI | None = None,
 ) -> Any:
     """Build and compile a LangGraph StateGraph from the config.yaml flow section.
 
     Parameters
     ----------
-    llm_client:
-        Optional pre-built AsyncOpenAI client. When provided, it is used
-        instead of calling build_client() — useful in tests.
+    model_chain:
+        ModelChain with ordered fallback models. Required when the flow
+        contains llm_call nodes. Build with model_factory.build_chain()
+        or ModelChain.from_mock() for tests.
     ctx_mgr:
         Optional ContextManager. Defaults to ContextManager.default().
     recorder:
         Optional OutcomeRecorder. Defaults to a recorder that logs to outcomes/.
     """
+    _tool_cfgs = tool_cfgs or []
+    _agent_endpoints = agent_endpoints or {}
     _ctx = ctx_mgr or ContextManager.default()
     _rec = recorder or OutcomeRecorder(
         agent=agent_name,
-        model=f"{model_cfg['provider']}/{model_cfg['model_id']}",
+        model=model_chain.primary_label if model_chain else "unknown",
     )
 
     builder = StateGraph(AgentState)
@@ -369,18 +345,22 @@ def build_graph(
             builder.add_node(nid, _make_passthrough(nid))
 
         elif ntype == "llm_call":
+            if model_chain is None:
+                raise ValueError(
+                    f"Node '{nid}' is type 'llm_call' but no model_chain was provided to build_graph()."
+                )
             builder.add_node(
                 nid,
                 _make_llm_call(
-                    nid, model_cfg, provider_cfg, ncfg, tool_cfgs,
-                    agent_name, _ctx, _rec, llm_client,
+                    nid, model_chain, ncfg, _tool_cfgs,
+                    agent_name, _ctx, _rec,
                 ),
             )
 
         elif ntype == "a2a_delegate":
             builder.add_node(
                 nid,
-                _make_a2a_delegate(nid, ncfg, agent_endpoints, outbound_token),
+                _make_a2a_delegate(nid, ncfg, _agent_endpoints, outbound_token),
             )
 
         else:
@@ -395,7 +375,6 @@ def build_graph(
     for edge in flow_cfg["edges"]:
         builder.add_edge(edge[0], edge[1])
 
-    # Leaf nodes auto-connect to END
     all_node_ids = {n["id"] for n in flow_cfg["nodes"]}
     for nid in all_node_ids - nodes_with_out:
         builder.add_edge(nid, END)

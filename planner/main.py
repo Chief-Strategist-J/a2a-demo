@@ -1,13 +1,3 @@
-"""Planner Agent — A2A config-driven implementation.
-
-Reads config.yaml, builds a LangGraph graph from the YAML flow definition,
-and exposes:
-  GET  /.well-known/agent.json   — A2A Agent Card (public)
-  GET  /health                   — liveness (public)
-  POST /ask                      — user-facing question endpoint (auth required)
-  GET  /ui                       — trace viewer UI (public)
-  GET  /ui/stream                — SSE stream for the trace UI (public)
-"""
 from __future__ import annotations
 
 import json
@@ -18,23 +8,25 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-# Make the repo root importable so `shared.*` resolves both locally and in Docker
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+if "pytest" not in sys.modules:
+    load_dotenv(Path(__file__).parent.parent / ".env")
 
 from shared import config as cfg_mod
 from shared import prompts as prompt_lib
 from shared.auth import BearerAuthMiddleware
 from shared.context import ContextManager
 from shared.graph_builder import AgentState, build_graph
+from shared.model_factory import build_chain
 from shared.outcomes import OutcomeRecorder
-import shared.tools.calculator  # noqa: F401  registers the tool
-import shared.tools.web_search   # noqa: F401  registers the tool
-
-# ── config ───────────────────────────────────────────────────
+import shared.tools.calculator
+import shared.tools.web_search
 
 _ROOT = Path(__file__).parent.parent
 _CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", _ROOT / "config.yaml"))
@@ -43,9 +35,8 @@ _CONTEXT_PATH = Path(os.environ.get("CONTEXT_PATH", _ROOT / "context.yaml"))
 
 cfg = cfg_mod.load(_CONFIG_PATH)
 agent_cfg = cfg.agents["planner"]
-provider_cfg = cfg.providers.get(agent_cfg.model.provider, {})
+_model_chain = build_chain(agent_cfg.model_chain, cfg.models, cfg.providers)
 
-# Token this agent sends when it calls the worker (planner's own identity)
 _OUTBOUND_TOKEN = cfg.auth.tokens.get("planner", "") if cfg.auth.enabled else ""
 
 logging.basicConfig(
@@ -55,27 +46,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("planner")
 
-# ── load prompts and context config ──────────────────────────
-
 if _PROMPTS_PATH.exists():
     prompt_lib.load(_PROMPTS_PATH)
-    log.info("Loaded %d prompts from %s", len(prompt_lib.list_prompts()), _PROMPTS_PATH)
 
-_ctx_managers = (
-    ContextManager.load(_CONTEXT_PATH) if _CONTEXT_PATH.exists() else {}
-)
+_ctx_managers = ContextManager.load(_CONTEXT_PATH) if _CONTEXT_PATH.exists() else {}
 _ctx = _ctx_managers.get("planner") or ContextManager.default()
-_recorder = OutcomeRecorder(
-    agent="planner",
-    model=f"{agent_cfg.model.provider}/{agent_cfg.model.model_id}",
-)
-
-# ── graph ────────────────────────────────────────────────────
+_recorder = OutcomeRecorder(agent="planner", model=_model_chain.primary_label)
 
 graph = build_graph(
     flow_cfg=agent_cfg.flow.model_dump(),
-    model_cfg=agent_cfg.model.model_dump(),
-    provider_cfg=provider_cfg,
+    model_chain=_model_chain,
     tool_cfgs=[t.model_dump() for t in agent_cfg.tools],
     agent_endpoints={k: v.model_dump() for k, v in cfg.agent_endpoints.items()},
     agent_name=agent_cfg.name,
@@ -84,35 +64,20 @@ graph = build_graph(
     outbound_token=_OUTBOUND_TOKEN,
 )
 
-# ── FastAPI app ──────────────────────────────────────────────
-
 app = FastAPI(title=agent_cfg.name, version="2.0.0")
 
 if cfg.auth.enabled:
-    app.add_middleware(
-        BearerAuthMiddleware,
-        valid_tokens=set(cfg.auth.tokens.values()),
-    )
-
-# ── A2A Agent Card ───────────────────────────────────────────
+    app.add_middleware(BearerAuthMiddleware, valid_tokens=set(cfg.auth.tokens.values()))
 
 _AGENT_CARD = {
     "name": agent_cfg.name,
     "description": agent_cfg.description,
     "url": agent_cfg.public_url,
     "version": "2.0.0",
-    "capabilities": {
-        "streaming": cfg.streaming.enabled,
-        "pushNotifications": False,
-    },
+    "capabilities": {"streaming": cfg.streaming.enabled, "pushNotifications": False},
     "skills": [
-        {
-            "id": s.id,
-            "name": s.name,
-            "description": s.description,
-            "inputModes": s.input_modes,
-            "outputModes": s.output_modes,
-        }
+        {"id": s.id, "name": s.name, "description": s.description,
+         "inputModes": s.input_modes, "outputModes": s.output_modes}
         for s in agent_cfg.skills
     ],
 }
@@ -125,14 +90,8 @@ async def agent_card():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "agent": agent_cfg.name,
-        "model": f"{agent_cfg.model.provider}/{agent_cfg.model.model_id}",
-    }
+    return {"status": "ok", "agent": agent_cfg.name, "model_chain": _model_chain.chain_labels}
 
-
-# ── user-facing endpoint ─────────────────────────────────────
 
 class Question(BaseModel):
     question: str
@@ -148,8 +107,6 @@ async def ask(body: Question):
     return {"question": body.question, "answer": final["answer"]}
 
 
-# ── trace UI ─────────────────────────────────────────────────
-
 @app.get("/ui/stream")
 async def ui_stream(question: str):
     async def _gen() -> AsyncIterator[bytes]:
@@ -158,7 +115,6 @@ async def ui_stream(question: str):
             stream_mode=["updates", "values"],
         ):
             yield f"event: {mode}\ndata: {json.dumps(chunk)}\n\n".encode()
-
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
@@ -172,6 +128,7 @@ def _build_ui() -> str:
     node_types = {n.id: n.type for n in agent_cfg.flow.nodes}
     nodes_js = json.dumps(nodes)
     node_types_js = json.dumps(node_types)
+    chain_label = " → ".join(_model_chain.chain_labels)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -219,33 +176,27 @@ button:disabled{{background:#3d444d;cursor:default}}
 <p class="sub">Real-time LangGraph + A2A execution trace</p>
 <div class="meta">
   <div>Agent: <span>{agent_cfg.name}</span></div>
-  <div>Model: <span>{agent_cfg.model.provider}/{agent_cfg.model.model_id}</span></div>
+  <div>Model chain: <span>{chain_label}</span></div>
   <div>Nodes: <span>{len(agent_cfg.flow.nodes)}</span></div>
   <div>Auth: <span>{'enabled' if cfg.auth.enabled else 'disabled'}</span></div>
   <div>Streaming: <span>{'enabled' if cfg.streaming.enabled else 'disabled'}</span></div>
 </div>
-
 <div class="row">
   <input type="text" id="q" placeholder="Ask anything…" value="What is Docker?" />
   <button id="btn" onclick="run()">Run</button>
 </div>
-
 <div class="flow" id="flow"></div>
-
 <div class="sec">
   <h2>Execution log</h2>
   <div id="log"><span style="color:#8b949e;font-size:.8rem">Waiting for run…</span></div>
 </div>
-
 <div class="sec hidden" id="ans-sec">
   <h2>Answer</h2>
   <div class="answer" id="ans"></div>
 </div>
-
 <script>
 const NODES={nodes_js};
 const TYPES={node_types_js};
-
 (function buildFlow(){{
   const c=document.getElementById("flow");
   NODES.forEach((n,i)=>{{
@@ -256,7 +207,6 @@ const TYPES={node_types_js};
     if(i<NODES.length-1){{const a=document.createElement("div");a.className="arr";a.id="a"+i;a.textContent="→";c.appendChild(a);}}
   }});
 }})();
-
 function reset(){{
   NODES.forEach(n=>{{document.getElementById("n-"+n).className="node";}});
   for(let i=0;i<NODES.length-1;i++)document.getElementById("a"+i).className="arr";
@@ -264,21 +214,17 @@ function reset(){{
   document.getElementById("ans-sec").classList.add("hidden");
   document.getElementById("ans").textContent="";
 }}
-
 function log2(tag,cls,text){{
   const d=document.createElement("div");d.className="line";
   d.innerHTML=`<span class="tag ${{cls}}">${{tag}}</span>${{esc(text)}}`;
   const c=document.getElementById("log");c.appendChild(d);c.scrollTop=c.scrollHeight;
 }}
-
 function esc(s){{return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}}
-
 function markDone(name){{
   const el=document.getElementById("n-"+name);if(el)el.className="node done";
   const idx=NODES.indexOf(name);
   if(idx>0){{const a=document.getElementById("a"+(idx-1));if(a)a.className="arr active";}}
 }}
-
 async function run(){{
   const q=document.getElementById("q").value.trim();if(!q)return;
   reset();
@@ -303,7 +249,6 @@ async function run(){{
   NODES.forEach(n=>{{document.getElementById("n-"+n).className="node done";}});
   for(let i=0;i<NODES.length-1;i++)document.getElementById("a"+i).className="arr active";
 }}
-
 function handle(et,ed){{
   if(!ed)return;let data;try{{data=JSON.parse(ed);}}catch{{return;}}
   if(et==="updates"){{
