@@ -4,3 +4,18 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Test artifacts
+.coverage
+coverage.json
+.pytest_cache/
+
+# LangGraph runtime cache
+.langgraph_api/
+*/.langgraph_api/
+
+# Runtime audit logs
+outcomes/
+
+# Claude Code internal
+.claude/

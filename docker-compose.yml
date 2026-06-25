@@ -1,15 +1,24 @@
 services:
 
   worker:
-    build: ./worker
+    build:
+      context: .                        # root = A2A/ so shared/ is reachable
+      dockerfile: worker/Dockerfile
     ports:
       - "8001:8001"
     env_file: .env
     environment:
       WORKER_PUBLIC_URL: "http://worker:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   planner:
-    build: ./planner
+    build:
+      context: .
+      dockerfile: planner/Dockerfile
     ports:
       - "8000:8000"
     env_file: .env
@@ -17,4 +26,5 @@ services:
       WORKER_URL: "http://worker:8001"
       PLANNER_PUBLIC_URL: "http://planner:8000"
     depends_on:
-      - worker
+      worker:
+        condition: service_healthy

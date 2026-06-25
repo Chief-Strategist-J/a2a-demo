@@ -1,0 +1,76 @@
+# ============================================================
+# Context Configuration
+# ============================================================
+# Controls what context is built for each LLM call:
+#   - what to inject into the system prompt
+#   - how to validate inputs and outputs
+#   - conversation history (currently stateless — set enabled: false)
+# ============================================================
+
+version: "1.0"
+
+agents:
+
+  worker:
+    input:
+      max_length: 4000            # max chars for the user question (hard reject beyond this)
+      strip_whitespace: true
+      reject_empty: true
+
+    injection:
+      current_date: true          # inject today's date into prompt vars
+      agent_name: true            # inject agent name from config.yaml
+      task_id: true               # include task_id in log context (not in prompt)
+
+    history:
+      enabled: false              # stateless — each task is independent
+      max_turns: 5                # (used when enabled: true)
+      strategy: tail              # tail = keep most recent turns
+
+    output:
+      reject_empty: true          # raise if LLM returns empty string
+      min_length: 1
+      strip_whitespace: true
+      max_length: 16000           # truncate runaway responses
+
+  planner:
+    input:
+      max_length: 4000
+      strip_whitespace: true
+      reject_empty: true
+
+    injection:
+      current_date: true
+      agent_name: true
+      task_id: true
+
+    history:
+      enabled: false
+      max_turns: 3
+      strategy: tail
+
+    output:
+      reject_empty: true
+      min_length: 1
+      strip_whitespace: true
+      max_length: 4000
+
+# ── Shared defaults (used when agent-specific section is absent) ──
+defaults:
+  input:
+    max_length: 4000
+    strip_whitespace: true
+    reject_empty: true
+  injection:
+    current_date: true
+    agent_name: true
+    task_id: true
+  history:
+    enabled: false
+    max_turns: 5
+    strategy: tail
+  output:
+    reject_empty: true
+    min_length: 1
+    strip_whitespace: true
+    max_length: 16000

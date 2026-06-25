@@ -1,5 +1,8 @@
-fastapi
-uvicorn[standard]
-langgraph
-httpx
-python-dotenv
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0
+langgraph>=0.2.0
+openai>=1.30.0
+pydantic>=2.7.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0

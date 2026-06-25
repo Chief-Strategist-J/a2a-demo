@@ -1,115 +1,138 @@
+"""Planner Agent — A2A config-driven implementation.
+
+Reads config.yaml, builds a LangGraph graph from the YAML flow definition,
+and exposes:
+  GET  /.well-known/agent.json   — A2A Agent Card (public)
+  GET  /health                   — liveness (public)
+  POST /ask                      — user-facing question endpoint (auth required)
+  GET  /ui                       — trace viewer UI (public)
+  GET  /ui/stream                — SSE stream for the trace UI (public)
+"""
+from __future__ import annotations
+
 import json
 import logging
 import os
-import uuid
-from typing import TypedDict, AsyncIterator
+import sys
+from pathlib import Path
+from typing import AsyncIterator
 
-import httpx
+import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
-from langgraph.graph import END, StateGraph
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  [planner]  %(message)s", datefmt="%H:%M:%S")
+# Make the repo root importable so `shared.*` resolves both locally and in Docker
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from shared import config as cfg_mod
+from shared import prompts as prompt_lib
+from shared.auth import BearerAuthMiddleware
+from shared.context import ContextManager
+from shared.graph_builder import AgentState, build_graph
+from shared.outcomes import OutcomeRecorder
+import shared.tools.calculator  # noqa: F401  registers the tool
+import shared.tools.web_search   # noqa: F401  registers the tool
+
+# ── config ───────────────────────────────────────────────────
+
+_ROOT = Path(__file__).parent.parent
+_CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", _ROOT / "config.yaml"))
+_PROMPTS_PATH = Path(os.environ.get("PROMPTS_PATH", _ROOT / "prompts.yaml"))
+_CONTEXT_PATH = Path(os.environ.get("CONTEXT_PATH", _ROOT / "context.yaml"))
+
+cfg = cfg_mod.load(_CONFIG_PATH)
+agent_cfg = cfg.agents["planner"]
+provider_cfg = cfg.providers.get(agent_cfg.model.provider, {})
+
+# Token this agent sends when it calls the worker (planner's own identity)
+_OUTBOUND_TOKEN = cfg.auth.tokens.get("planner", "") if cfg.auth.enabled else ""
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  [planner]  %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("planner")
 
-WORKER_URL = os.environ.get("WORKER_URL", "http://localhost:8001")
+# ── load prompts and context config ──────────────────────────
 
+if _PROMPTS_PATH.exists():
+    prompt_lib.load(_PROMPTS_PATH)
+    log.info("Loaded %d prompts from %s", len(prompt_lib.list_prompts()), _PROMPTS_PATH)
 
-class PlannerState(TypedDict):
-    question: str
-    answer: str
+_ctx_managers = (
+    ContextManager.load(_CONTEXT_PATH) if _CONTEXT_PATH.exists() else {}
+)
+_ctx = _ctx_managers.get("planner") or ContextManager.default()
+_recorder = OutcomeRecorder(
+    agent="planner",
+    model=f"{agent_cfg.model.provider}/{agent_cfg.model.model_id}",
+)
 
+# ── graph ────────────────────────────────────────────────────
 
-def receive_question(state: PlannerState) -> dict:
-    log.info("─" * 60)
-    log.info(f"[node: receive_question]  question='{state['question']}'")
-    return {}
+graph = build_graph(
+    flow_cfg=agent_cfg.flow.model_dump(),
+    model_cfg=agent_cfg.model.model_dump(),
+    provider_cfg=provider_cfg,
+    tool_cfgs=[t.model_dump() for t in agent_cfg.tools],
+    agent_endpoints={k: v.model_dump() for k, v in cfg.agent_endpoints.items()},
+    agent_name=agent_cfg.name,
+    ctx_mgr=_ctx,
+    recorder=_recorder,
+    outbound_token=_OUTBOUND_TOKEN,
+)
 
+# ── FastAPI app ──────────────────────────────────────────────
 
-async def delegate_to_worker(state: PlannerState) -> dict:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        card_resp = await client.get(f"{WORKER_URL}/.well-known/agent.json")
-        card_resp.raise_for_status()
-        agent_card: dict = card_resp.json()
+app = FastAPI(title=agent_cfg.name, version="2.0.0")
 
-    log.info(f"[node: delegate_to_worker]  Worker='{agent_card['name']}'  url={agent_card['url']}")
+if cfg.auth.enabled:
+    app.add_middleware(
+        BearerAuthMiddleware,
+        valid_tokens=set(cfg.auth.tokens.values()),
+    )
 
-    task_id = str(uuid.uuid4())
-    jsonrpc_request = {
-        "jsonrpc": "2.0",
-        "id": f"req-{task_id}",
-        "method": "tasks/send",
-        "params": {
-            "id": task_id,
-            "message": {
-                "role": "user",
-                "parts": [{"type": "text", "text": state["question"]}],
-            },
-        },
-    }
+# ── A2A Agent Card ───────────────────────────────────────────
 
-    log.info(f"[A2A →]  POST {WORKER_URL}/")
-    log.info(f"[A2A →]  request:\n{json.dumps(jsonrpc_request, indent=2)}")
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(f"{WORKER_URL}/", json=jsonrpc_request)
-        resp.raise_for_status()
-        jsonrpc_response: dict = resp.json()
-
-    log.info(f"[A2A ←]  response:\n{json.dumps(jsonrpc_response, indent=2)}")
-
-    if "error" in jsonrpc_response:
-        raise RuntimeError(f"A2A error from Worker: {jsonrpc_response['error']}")
-
-    result = jsonrpc_response["result"]
-    if result["status"]["state"] != "completed":
-        raise RuntimeError(f"Unexpected task state: '{result['status']['state']}'")
-
-    return {"answer": result["status"]["message"]["parts"][0]["text"]}
-
-
-def return_answer(state: PlannerState) -> dict:
-    log.info(f"[node: return_answer]  answer ready ({len(state['answer'])} chars)")
-    log.info("─" * 60)
-    return {}
-
-
-_builder = StateGraph(PlannerState)
-_builder.add_node("receive_question", receive_question)
-_builder.add_node("delegate_to_worker", delegate_to_worker)
-_builder.add_node("return_answer", return_answer)
-_builder.set_entry_point("receive_question")
-_builder.add_edge("receive_question", "delegate_to_worker")
-_builder.add_edge("delegate_to_worker", "return_answer")
-_builder.add_edge("return_answer", END)
-
-graph = _builder.compile()
-
-app = FastAPI(title="Planner Agent")
-
-AGENT_CARD = {
-    "name": "Planner Agent",
-    "description": "Receives questions and delegates them to Worker agents via A2A",
-    "url": os.environ.get("PLANNER_PUBLIC_URL", "http://localhost:8000"),
-    "version": "1.0.0",
-    "capabilities": {"streaming": False, "pushNotifications": False},
+_AGENT_CARD = {
+    "name": agent_cfg.name,
+    "description": agent_cfg.description,
+    "url": agent_cfg.public_url,
+    "version": "2.0.0",
+    "capabilities": {
+        "streaming": cfg.streaming.enabled,
+        "pushNotifications": False,
+    },
     "skills": [
         {
-            "id": "plan-and-answer",
-            "name": "Plan and Answer",
-            "description": "Delegates questions to the right Worker agent",
-            "inputModes": ["text"],
-            "outputModes": ["text"],
+            "id": s.id,
+            "name": s.name,
+            "description": s.description,
+            "inputModes": s.input_modes,
+            "outputModes": s.output_modes,
         }
+        for s in agent_cfg.skills
     ],
 }
 
 
 @app.get("/.well-known/agent.json")
 async def agent_card():
-    return AGENT_CARD
+    return _AGENT_CARD
 
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "agent": agent_cfg.name,
+        "model": f"{agent_cfg.model.provider}/{agent_cfg.model.model_id}",
+    }
+
+
+# ── user-facing endpoint ─────────────────────────────────────
 
 class Question(BaseModel):
     question: str
@@ -118,218 +141,185 @@ class Question(BaseModel):
 @app.post("/ask")
 async def ask(body: Question):
     log.info("═" * 60)
-    log.info(f"[API /ask]  question='{body.question}'")
-
-    final_state: PlannerState = await graph.ainvoke(
-        {"question": body.question, "answer": ""},
+    log.info("[/ask]  question='%s'", body.question)
+    final: AgentState = await graph.ainvoke(
+        {"task_id": "", "question": body.question, "answer": "", "tool_results": []}
     )
+    return {"question": body.question, "answer": final["answer"]}
 
-    return {"question": body.question, "answer": final_state["answer"]}
 
+# ── trace UI ─────────────────────────────────────────────────
 
-_UI_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>A2A Trace Viewer</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; padding: 32px; }
-  h1 { color: #58a6ff; font-size: 1.4rem; margin-bottom: 6px; }
-  .subtitle { color: #8b949e; font-size: 0.8rem; margin-bottom: 32px; }
-  .input-row { display: flex; gap: 10px; margin-bottom: 36px; }
-  input[type=text] { flex: 1; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; padding: 10px 14px; font-family: inherit; font-size: 0.95rem; outline: none; }
-  input[type=text]:focus { border-color: #58a6ff; }
-  button { background: #238636; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-family: inherit; font-size: 0.95rem; padding: 10px 22px; }
-  button:hover { background: #2ea043; }
-  button:disabled { background: #3d444d; cursor: default; }
+@app.get("/ui/stream")
+async def ui_stream(question: str):
+    async def _gen() -> AsyncIterator[bytes]:
+        async for mode, chunk in graph.astream(
+            {"task_id": "", "question": question, "answer": "", "tool_results": []},
+            stream_mode=["updates", "values"],
+        ):
+            yield f"event: {mode}\ndata: {json.dumps(chunk)}\n\n".encode()
 
-  .flow { display: flex; align-items: center; gap: 0; margin-bottom: 36px; }
-  .node { background: #161b22; border: 2px solid #30363d; border-radius: 10px; padding: 14px 20px; min-width: 170px; text-align: center; transition: all 0.3s; }
-  .node .label { font-size: 0.7rem; color: #8b949e; letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 4px; }
-  .node .name { font-size: 0.95rem; color: #c9d1d9; }
-  .node.active { border-color: #f0883e; box-shadow: 0 0 18px rgba(240,136,62,0.4); }
-  .node.active .name { color: #f0883e; }
-  .node.done { border-color: #238636; }
-  .node.done .name { color: #3fb950; }
-  .arrow { color: #30363d; font-size: 1.4rem; padding: 0 6px; flex-shrink: 0; }
-  .arrow.active { color: #3fb950; }
-
-  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
-  .section h2 { color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }
-  .log-line { font-size: 0.82rem; padding: 2px 0; border-bottom: 1px solid #1c2128; }
-  .log-line:last-child { border-bottom: none; }
-  .tag { display: inline-block; border-radius: 4px; padding: 1px 7px; font-size: 0.72rem; margin-right: 6px; }
-  .tag.node  { background: #1c2d3a; color: #58a6ff; }
-  .tag.a2a   { background: #2d1c3a; color: #d2a8ff; }
-  .tag.data  { background: #1c2b20; color: #3fb950; }
-  .answer-box { background: #0d1117; border: 1px solid #238636; border-radius: 6px; padding: 14px; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.6; color: #c9d1d9; }
-  .hidden { display: none; }
-</style>
-</head>
-<body>
-<h1>A2A Trace Viewer</h1>
-<p class="subtitle">Real-time trace of the Planner → Worker A2A graph &nbsp;·&nbsp; No LangSmith required</p>
-
-<div class="input-row">
-  <input type="text" id="q" placeholder="Ask anything… e.g. What is Docker?" value="What is Docker?" />
-  <button id="run-btn" onclick="runGraph()">Run</button>
-</div>
-
-<div class="flow">
-  <div class="node" id="n-receive_question">
-    <div class="label">planner node 1</div>
-    <div class="name">receive_question</div>
-  </div>
-  <div class="arrow" id="a1">→</div>
-  <div class="node" id="n-delegate_to_worker">
-    <div class="label">planner node 2</div>
-    <div class="name">delegate_to_worker</div>
-  </div>
-  <div class="arrow" id="a2">→</div>
-  <div class="node" id="n-return_answer">
-    <div class="label">planner node 3</div>
-    <div class="name">return_answer</div>
-  </div>
-</div>
-
-<div class="section" id="log-section">
-  <h2>Execution log</h2>
-  <div id="log-lines"><span style="color:#8b949e;font-size:0.82rem">Waiting for run…</span></div>
-</div>
-
-<div class="section hidden" id="answer-section">
-  <h2>Answer</h2>
-  <div class="answer-box" id="answer-box"></div>
-</div>
-
-<script>
-const NODES = ["receive_question", "delegate_to_worker", "return_answer"];
-
-function resetUI() {
-  NODES.forEach(n => { const el = document.getElementById("n-"+n); el.className = "node"; });
-  [1,2].forEach(i => document.getElementById("a"+i).className = "arrow");
-  document.getElementById("log-lines").innerHTML = "";
-  document.getElementById("answer-section").classList.add("hidden");
-  document.getElementById("answer-box").textContent = "";
-}
-
-function addLog(tag, cls, text) {
-  const div = document.createElement("div");
-  div.className = "log-line";
-  div.innerHTML = `<span class="tag ${cls}">${tag}</span>${escHtml(text)}`;
-  const container = document.getElementById("log-lines");
-  container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
-
-function markActive(name) {
-  NODES.forEach(n => {
-    const el = document.getElementById("n-"+n);
-    if (n === name) el.className = "node active";
-    else if (el.className === "node active") el.className = "node done";
-  });
-}
-
-async function runGraph() {
-  const question = document.getElementById("q").value.trim();
-  if (!question) return;
-  resetUI();
-  const btn = document.getElementById("run-btn");
-  btn.disabled = true;
-  btn.textContent = "Running…";
-
-  addLog("start", "data", `question: "${question}"`);
-
-  try {
-    // Proxy through /ui/stream on this server (avoids CORS)
-    const url = `/ui/stream?question=${encodeURIComponent(question)}`;
-    const resp = await fetch(url);
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const parts = buf.split("\\n\\n");
-      buf = parts.pop();
-      for (const part of parts) {
-        if (!part.trim()) continue;
-        const lines = part.split("\\n");
-        let evtType = "", evtData = "";
-        for (const line of lines) {
-          if (line.startsWith("event: ")) evtType = line.slice(7).trim();
-          if (line.startsWith("data: ")) evtData = line.slice(6).trim();
-        }
-        handleEvent(evtType, evtData);
-      }
-    }
-  } catch(e) {
-    addLog("error", "a2a", e.message);
-  }
-
-  btn.disabled = false;
-  btn.textContent = "Run";
-  NODES.forEach(n => { document.getElementById("n-"+n).className = "node done"; });
-  [1,2].forEach(i => document.getElementById("a"+i).className = "arrow active");
-}
-
-function handleEvent(evtType, evtData) {
-  if (!evtData) return;
-  let data;
-  try { data = JSON.parse(evtData); } catch { return; }
-
-  if (evtType === "updates") {
-    const nodeNames = Object.keys(data);
-    if (nodeNames.length) {
-      const name = nodeNames[0];
-      markActive(name);
-      const el = document.getElementById("n-"+name);
-      if (el) el.className = "node active";
-      addLog("node", "node", name);
-      const val = data[name];
-      if (val && typeof val === "object") {
-        for (const [k, v] of Object.entries(val)) {
-          if (k === "answer" && v) {
-            addLog("a2a", "a2a", `answer received (${String(v).length} chars)`);
-          }
-        }
-      }
-    }
-  } else if (evtType === "values") {
-    if (data.answer) {
-      document.getElementById("answer-section").classList.remove("hidden");
-      document.getElementById("answer-box").textContent = data.answer;
-    }
-  } else if (evtType === "error") {
-    addLog("error", "a2a", JSON.stringify(data));
-  }
-}
-</script>
-</body>
-</html>
-"""
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 @app.get("/ui", response_class=HTMLResponse)
 async def trace_ui():
-    return _UI_HTML
+    return _build_ui()
 
 
-@app.get("/ui/stream")
-async def trace_stream(question: str):
-    async def event_generator() -> AsyncIterator[bytes]:
-        async for mode, chunk in graph.astream(
-            {"question": question, "answer": ""},
-            stream_mode=["updates", "values"],
-        ):
-            data = json.dumps(chunk)
-            yield f"event: {mode}\ndata: {data}\n\n".encode()
+def _build_ui() -> str:
+    nodes = [n.id for n in agent_cfg.flow.nodes]
+    node_types = {n.id: n.type for n in agent_cfg.flow.nodes}
+    nodes_js = json.dumps(nodes)
+    node_types_js = json.dumps(node_types)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>A2A Trace — {agent_cfg.name}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;min-height:100vh;padding:32px}}
+h1{{color:#58a6ff;font-size:1.4rem;margin-bottom:6px}}
+.sub{{color:#8b949e;font-size:.8rem;margin-bottom:20px}}
+.meta{{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 16px;margin-bottom:24px;font-size:.78rem;color:#8b949e;display:flex;gap:24px;flex-wrap:wrap}}
+.meta span{{color:#58a6ff}}
+.row{{display:flex;gap:10px;margin-bottom:28px}}
+input{{flex:1;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:10px 14px;font-family:inherit;font-size:.95rem;outline:none}}
+input:focus{{border-color:#58a6ff}}
+button{{background:#238636;border:none;border-radius:6px;color:#fff;cursor:pointer;font-family:inherit;font-size:.95rem;padding:10px 22px}}
+button:hover{{background:#2ea043}}
+button:disabled{{background:#3d444d;cursor:default}}
+.flow{{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin-bottom:28px}}
+.node{{background:#161b22;border:2px solid #30363d;border-radius:10px;padding:12px 18px;min-width:160px;text-align:center;transition:all .3s;margin:4px}}
+.node .lbl{{font-size:.65rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px}}
+.node .nm{{font-size:.9rem;color:#c9d1d9}}
+.node .tp{{font-size:.65rem;color:#444d56;margin-top:2px}}
+.node.active{{border-color:#f0883e;box-shadow:0 0 18px rgba(240,136,62,.4)}}
+.node.active .nm{{color:#f0883e}}
+.node.done{{border-color:#238636}}
+.node.done .nm{{color:#3fb950}}
+.arr{{color:#30363d;font-size:1.4rem;padding:0 4px;flex-shrink:0}}
+.arr.active{{color:#3fb950}}
+.sec{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:14px}}
+.sec h2{{color:#8b949e;font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}}
+.line{{font-size:.8rem;padding:2px 0;border-bottom:1px solid #1c2128}}
+.line:last-child{{border-bottom:none}}
+.tag{{display:inline-block;border-radius:4px;padding:1px 6px;font-size:.7rem;margin-right:5px}}
+.tag.nd{{background:#1c2d3a;color:#58a6ff}}
+.tag.a2{{background:#2d1c3a;color:#d2a8ff}}
+.tag.dt{{background:#1c2b20;color:#3fb950}}
+.tag.er{{background:#3a1c1c;color:#f85149}}
+.answer{{background:#0d1117;border:1px solid #238636;border-radius:6px;padding:14px;white-space:pre-wrap;font-size:.9rem;line-height:1.6;color:#c9d1d9}}
+.hidden{{display:none}}
+</style>
+</head>
+<body>
+<h1>A2A Trace Viewer</h1>
+<p class="sub">Real-time LangGraph + A2A execution trace</p>
+<div class="meta">
+  <div>Agent: <span>{agent_cfg.name}</span></div>
+  <div>Model: <span>{agent_cfg.model.provider}/{agent_cfg.model.model_id}</span></div>
+  <div>Nodes: <span>{len(agent_cfg.flow.nodes)}</span></div>
+  <div>Auth: <span>{'enabled' if cfg.auth.enabled else 'disabled'}</span></div>
+  <div>Streaming: <span>{'enabled' if cfg.streaming.enabled else 'disabled'}</span></div>
+</div>
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+<div class="row">
+  <input type="text" id="q" placeholder="Ask anything…" value="What is Docker?" />
+  <button id="btn" onclick="run()">Run</button>
+</div>
+
+<div class="flow" id="flow"></div>
+
+<div class="sec">
+  <h2>Execution log</h2>
+  <div id="log"><span style="color:#8b949e;font-size:.8rem">Waiting for run…</span></div>
+</div>
+
+<div class="sec hidden" id="ans-sec">
+  <h2>Answer</h2>
+  <div class="answer" id="ans"></div>
+</div>
+
+<script>
+const NODES={nodes_js};
+const TYPES={node_types_js};
+
+(function buildFlow(){{
+  const c=document.getElementById("flow");
+  NODES.forEach((n,i)=>{{
+    const d=document.createElement("div");
+    d.className="node";d.id="n-"+n;
+    d.innerHTML=`<div class="lbl">node ${{i+1}}</div><div class="nm">${{n}}</div><div class="tp">${{TYPES[n]||""}}</div>`;
+    c.appendChild(d);
+    if(i<NODES.length-1){{const a=document.createElement("div");a.className="arr";a.id="a"+i;a.textContent="→";c.appendChild(a);}}
+  }});
+}})();
+
+function reset(){{
+  NODES.forEach(n=>{{document.getElementById("n-"+n).className="node";}});
+  for(let i=0;i<NODES.length-1;i++)document.getElementById("a"+i).className="arr";
+  document.getElementById("log").innerHTML="";
+  document.getElementById("ans-sec").classList.add("hidden");
+  document.getElementById("ans").textContent="";
+}}
+
+function log2(tag,cls,text){{
+  const d=document.createElement("div");d.className="line";
+  d.innerHTML=`<span class="tag ${{cls}}">${{tag}}</span>${{esc(text)}}`;
+  const c=document.getElementById("log");c.appendChild(d);c.scrollTop=c.scrollHeight;
+}}
+
+function esc(s){{return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}}
+
+function markDone(name){{
+  const el=document.getElementById("n-"+name);if(el)el.className="node done";
+  const idx=NODES.indexOf(name);
+  if(idx>0){{const a=document.getElementById("a"+(idx-1));if(a)a.className="arr active";}}
+}}
+
+async function run(){{
+  const q=document.getElementById("q").value.trim();if(!q)return;
+  reset();
+  const btn=document.getElementById("btn");btn.disabled=true;btn.textContent="Running…";
+  log2("start","dt",`question: "${{q}}"`);
+  try{{
+    const resp=await fetch(`/ui/stream?question=${{encodeURIComponent(q)}}`);
+    const reader=resp.body.getReader();const dec=new TextDecoder();let buf="";
+    while(true){{
+      const{{value,done}}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{{stream:true}});
+      const parts=buf.split("\\n\\n");buf=parts.pop();
+      for(const part of parts){{
+        if(!part.trim())continue;
+        const lines=part.split("\\n");let et="",ed="";
+        for(const l of lines){{if(l.startsWith("event: "))et=l.slice(7).trim();if(l.startsWith("data: "))ed=l.slice(6).trim();}}
+        handle(et,ed);
+      }}
+    }}
+  }}catch(e){{log2("error","er",e.message);}}
+  btn.disabled=false;btn.textContent="Run";
+  NODES.forEach(n=>{{document.getElementById("n-"+n).className="node done";}});
+  for(let i=0;i<NODES.length-1;i++)document.getElementById("a"+i).className="arr active";
+}}
+
+function handle(et,ed){{
+  if(!ed)return;let data;try{{data=JSON.parse(ed);}}catch{{return;}}
+  if(et==="updates"){{
+    const keys=Object.keys(data);if(!keys.length)return;
+    const name=keys[0];log2("node","nd",name);markDone(name);
+    const val=data[name];
+    if(val?.answer)log2("a2a","a2","answer received ("+String(val.answer).length+" chars)");
+    if(val?.tool_results?.length)log2("tool","dt","tools used: "+val.tool_results.map(t=>t.tool).join(", "));
+  }}else if(et==="values"){{
+    if(data.answer){{document.getElementById("ans-sec").classList.remove("hidden");document.getElementById("ans").textContent=data.answer;}}
+  }}else if(et==="error"){{log2("error","er",JSON.stringify(data));}}
+}}
+</script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=agent_cfg.port, reload=True)

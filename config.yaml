@@ -1,0 +1,164 @@
+# ============================================================
+# A2A Agent System — Master Configuration
+# ============================================================
+# Environment variables: ${VAR_NAME:default_value}
+# Change provider/model here without touching any Python code.
+# ============================================================
+
+agents:
+
+  planner:
+    name: "Planner Agent"
+    description: "Receives user questions and delegates to Worker agents via A2A"
+    port: 8000
+    public_url: "${PLANNER_PUBLIC_URL:http://localhost:8000}"
+
+    model:
+      provider: groq                      # groq | gemini | openrouter | ollama
+      model_id: llama-3.1-8b-instant      # see providers section below for options
+      temperature: 0.1
+      max_tokens: 1024
+
+    # LangGraph flow — nodes and edges declared here.
+    # Node types: passthrough | llm_call | a2a_delegate
+    # Leaf nodes (no outgoing edge) are auto-connected to END.
+    flow:
+      entry: receive_question
+      nodes:
+        - id: receive_question
+          type: passthrough
+
+        - id: delegate_to_worker
+          type: a2a_delegate
+          config:
+            target_agent: worker          # key under agent_endpoints below
+            streaming: true               # use tasks/sendSubscribe + SSE
+            # prompt_id: planner_router   # uncomment to add an LLM refinement step before delegating
+
+        - id: return_answer
+          type: passthrough
+      edges:
+        - [receive_question, delegate_to_worker]
+        - [delegate_to_worker, return_answer]
+        # return_answer has no outgoing edge → auto-connected to END
+
+    tools: []                             # planner has no tools
+
+    skills:
+      - id: plan-and-answer
+        name: "Plan and Answer"
+        description: "Delegates questions to the right Worker agent"
+        input_modes: [text]
+        output_modes: [text]
+
+  # ----------------------------------------------------------
+
+  worker:
+    name: "Worker Agent"
+    description: "Answers questions using a configurable AI model"
+    port: 8001
+    public_url: "${WORKER_PUBLIC_URL:http://localhost:8001}"
+
+    model:
+      provider: groq
+      model_id: llama-3.1-8b-instant
+      temperature: 0.1
+      max_tokens: 1024
+
+    flow:
+      entry: receive_task
+      nodes:
+        - id: receive_task
+          type: passthrough
+
+        - id: call_ai
+          type: llm_call
+          config:
+            prompt_id: worker_default     # from prompts.yaml (overrides system_prompt when set)
+            system_prompt: "You are a helpful assistant. Answer clearly and concisely."
+            use_tools: true               # inject tools that are enabled below
+
+        - id: format_response
+          type: passthrough
+      edges:
+        - [receive_task, call_ai]
+        - [call_ai, format_response]
+
+    # Toggle enabled: true to activate a tool.
+    # The tool must be registered in shared/tools/<name>.py
+    tools:
+      - name: calculator
+        enabled: false
+        description: "Evaluate arithmetic expressions (e.g. 2 + 2 * 3)"
+
+      - name: web_search
+        enabled: false
+        description: "Search the web for current information"
+
+    skills:
+      - id: answer-question
+        name: "Answer Question"
+        description: "Answers any natural-language question"
+        input_modes: [text]
+        output_modes: [text]
+
+# ============================================================
+# Named agent endpoint registry — used by a2a_delegate nodes
+# ============================================================
+agent_endpoints:
+  worker:
+    url: "${WORKER_URL:http://localhost:8001}"
+
+# ============================================================
+# Auth — bearer tokens for all A2A requests
+# ============================================================
+auth:
+  enabled: true
+  # Each agent presents its OWN token when calling another agent.
+  # All agents accept ALL tokens listed here (dev setup).
+  tokens:
+    planner: "${PLANNER_TOKEN:planner-dev-token}"
+    worker: "${WORKER_TOKEN:worker-dev-token}"
+
+# ============================================================
+# Streaming
+# ============================================================
+streaming:
+  enabled: true
+
+# ============================================================
+# Provider API configuration
+# Swap provider + model_id in the agent section to switch.
+# ============================================================
+providers:
+
+  groq:
+    api_key: "${GROQ_API_KEY}"
+    base_url: "https://api.groq.com/openai/v1"
+    # Free tier (no credit card): https://console.groq.com
+    # Models:
+    #   llama-3.1-8b-instant   (fastest)
+    #   llama-3.1-70b-versatile
+    #   mixtral-8x7b-32768
+    #   gemma2-9b-it
+
+  gemini:
+    api_key: "${GEMINI_API_KEY}"
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    # Free tier: https://aistudio.google.com/app/apikey
+    # Models: gemini-1.5-flash, gemini-1.5-flash-8b, gemini-2.0-flash-exp
+
+  openrouter:
+    api_key: "${OPENROUTER_API_KEY}"
+    base_url: "https://openrouter.ai/api/v1"
+    # Free models (append :free): https://openrouter.ai/models?q=free
+    # Models:
+    #   meta-llama/llama-3.1-8b-instruct:free
+    #   mistralai/mistral-7b-instruct:free
+    #   google/gemma-2-9b-it:free
+
+  ollama:
+    api_key: "ollama"
+    base_url: "${OLLAMA_URL:http://localhost:11434}/v1"
+    # Fully local. Run: ollama serve && ollama pull llama3.1
+    # Models: llama3.1, mistral, phi3, gemma2

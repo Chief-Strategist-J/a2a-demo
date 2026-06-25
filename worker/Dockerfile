@@ -2,15 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies first (Docker layer caching – rebuilt only when
-# requirements.txt changes, not on every code change)
-COPY requirements.txt .
+COPY worker/requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy agent source
-COPY . .
+COPY shared/ ./shared/
+COPY worker/main.py main.py
+COPY config.yaml config.yaml
 
-# Expose the Worker's A2A port
+ENV CONFIG_PATH=/app/config.yaml
 EXPOSE 8001
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--log-level", "info"]
