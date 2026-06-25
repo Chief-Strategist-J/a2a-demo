@@ -7,8 +7,9 @@ ADD ./config.yaml /deps/config.yaml
 ADD ./prompts.yaml /deps/prompts.yaml
 ADD ./context.yaml /deps/context.yaml
 
-RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e /deps/planner && \
-    PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e /deps/worker
+RUN --mount=type=cache,target=/root/.cache/uv \
+    PYTHONDONTWRITEBYTECODE=1 uv pip install --system -c /api/constraints.txt -e /deps/planner && \
+    PYTHONDONTWRITEBYTECODE=1 uv pip install --system -c /api/constraints.txt -e /deps/worker
 
 ENV LANGSERVE_GRAPHS='{"planner_graph": "/deps/planner/main.py:graph", "worker_graph": "/deps/worker/main.py:graph"}'
 ENV CONFIG_PATH=/deps/config.yaml
@@ -17,4 +18,5 @@ ENV CONTEXT_PATH=/deps/context.yaml
 
 RUN mkdir -p /api/langgraph_api /api/langgraph_runtime /api/langgraph_license && \
     touch /api/langgraph_api/__init__.py /api/langgraph_runtime/__init__.py /api/langgraph_license/__init__.py
-RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir --no-deps -e /api
+RUN --mount=type=cache,target=/root/.cache/uv \
+    PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-deps -e /api
