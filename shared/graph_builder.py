@@ -26,7 +26,12 @@ import json
 import logging
 import time
 import uuid
+import sys
 from typing import Any, AsyncIterator, TypedDict
+if sys.version_info >= (3, 11):
+    from typing import NotRequired
+else:
+    from typing_extensions import NotRequired
 
 import httpx
 from langgraph.graph import END, StateGraph
@@ -42,10 +47,10 @@ log = logging.getLogger(__name__)
 
 
 class AgentState(TypedDict):
-    task_id: str
     question: str
-    answer: str
-    tool_results: list[dict]
+    task_id: NotRequired[str]
+    answer: NotRequired[str]
+    tool_results: NotRequired[list[dict]]
 
 
 
